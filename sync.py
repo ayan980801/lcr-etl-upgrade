@@ -1,8 +1,12 @@
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
-from psycopg2 import OperationalError
+from psycopg2 import extras, pool, OperationalError
+from typing import Dict, Optional
+import concurrent.futures
 import logging
+import os
 import psycopg2
+import re
 import traceback
 from pyspark.sql.functions import current_timestamp, lit
 
@@ -10,39 +14,13 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Runtime configuration
-run_sync: bool = False
-
 # Create SparkSession
 spark = SparkSession.builder.getOrCreate()
-
-try:
-    from pyspark.dbutils import DBUtils
-
-    dbutils = DBUtils(spark)
-except Exception:
-
-    class _DummyDBUtils:
-        def __getattr__(self, name):
-            def _(*args, **kwargs):
-                raise RuntimeError("dbutils is not available")
-
-            return _
-
-    dbutils = _DummyDBUtils()  # type: ignore
-
-
-def _get_secret(scope: str, key: str) -> str:
-    try:
-        return dbutils.secrets.get(scope=scope, key=key)
-    except Exception:
-        logging.warning("Secret %s/%s unavailable, using empty string", scope, key)
-        return ""
 
 
 # Postgres Handler
 class PostgresDataHandler:
-    def __init__(self, pg_pool) -> None:
+    def __init__(self, pg_pool):
         self.pg_pool = pg_pool
 
     @staticmethod
@@ -53,7 +31,7 @@ class PostgresDataHandler:
             logging.error(f"Failed to connect to PostgreSQL: {str(e)}")
             raise
 
-    def is_connection_alive(self) -> bool:
+    def is_connection_alive(self):
         conn = self.pg_pool.getconn()
         try:
             with conn.cursor() as cursor:
@@ -65,7 +43,7 @@ class PostgresDataHandler:
             self.pg_pool.putconn(conn)
 
     def get_table_count(self, table: str) -> int:
-        # Get actual row count from PostgreSQL table
+        """Get actual row count from PostgreSQL table"""
         conn = self.pg_pool.getconn()
         try:
             with conn.cursor() as cursor:
@@ -77,40 +55,44 @@ class PostgresDataHandler:
             self.pg_pool.putconn(conn)
 
     def export_table_to_delta(self, table: str, stage: str, db: str) -> None:
-        # Export a table directly from PostgreSQL to Delta Lake using JDBC
+        """
+        Export a table directly from PostgreSQL to Delta Lake using JDBC
+        This bypasses CSV completely and avoids all the row count issues
+        """
         try:
             # Get actual row count from PostgreSQL for verification
             pg_count = self.get_table_count(table)
             logging.info(f"Starting direct JDBC export of {pg_count} rows from {table}")
-
+            
             # Create JDBC URL and properties
             jdbc_url = f"jdbc:postgresql://{pg_config['host']}:{pg_config['port']}/{pg_config['database']}"
             properties = {
-                "user": pg_config["user"],
-                "password": pg_config["password"],
+                "user": pg_config['user'],
+                "password": pg_config['password'],
                 "driver": "org.postgresql.Driver",
                 # Increase fetch size for better performance
-                "fetchsize": "10000",
+                "fetchsize": "10000"
             }
-
+            
+            # Table name without quotes for JDBC
+            table_name = table.replace('"', '')
+            
             # Use Spark's JDBC reader to load directly from PostgreSQL
             # This completely avoids any CSV intermediate step
             df = spark.read.jdbc(url=jdbc_url, table=table, properties=properties)
-
+            
             # Log the schema to verify correct data types
             logging.info(f"JDBC schema for {table}:")
             for field in df.schema.fields:
                 logging.info(f"  {field.name}: {field.dataType}")
-
+            
             # Count rows to verify
             jdbc_count = df.count()
             logging.info(f"JDBC read {jdbc_count} rows from {table}")
-
+            
             if jdbc_count != pg_count:
-                logging.warning(
-                    f"Row count mismatch: PostgreSQL={pg_count}, JDBC={jdbc_count}"
-                )
-
+                logging.warning(f"Row count mismatch: PostgreSQL={pg_count}, JDBC={jdbc_count}")
+            
             # Add metadata columns
             df = df.withColumns(
                 {
@@ -121,30 +103,26 @@ class PostgresDataHandler:
                     "EDW_EXTERNAL_SOURCE_SYSTEM": lit("LeadCustodyRepository"),
                 }
             )
-
+            
             # Calculate Delta Lake path
-            clean_table = table.replace('public."', "").replace('"', "")
+            clean_table = table.replace('public."', '').replace('"', '')
             flp = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}/{clean_table}"
-
+            
             # Write to Delta Lake
             df.write.format("delta").mode("overwrite").option(
                 "overwriteSchema", "true"
             ).save(flp)
-
+            
             # Verify Delta file row count
             delta_df = spark.read.format("delta").load(flp)
             delta_count = delta_df.count()
             logging.info(f"Delta file count for {table}: {delta_count}")
-
+            
             if delta_count != jdbc_count:
-                logging.warning(
-                    f"Delta count ({delta_count}) doesn't match JDBC count ({jdbc_count})"
-                )
+                logging.warning(f"Delta count ({delta_count}) doesn't match JDBC count ({jdbc_count})")
             else:
-                logging.info(
-                    f"Successfully exported {delta_count} rows from {table} to Delta"
-                )
-
+                logging.info(f"Successfully exported {delta_count} rows from {table} to Delta")
+                
         except Exception as e:
             logging.error(f"Failed to export table '{table}': {str(e)}")
             logging.error(traceback.format_exc())
@@ -153,7 +131,7 @@ class PostgresDataHandler:
 
 # Azure Data Handler
 class AzureDataHandler:
-    def __init__(self, blob_service_client) -> None:
+    def __init__(self, blob_service_client):
         self.blob_service_client = blob_service_client
 
     @staticmethod
@@ -169,7 +147,7 @@ class AzureDataHandler:
         try:
             db_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}"
             dbutils.fs.ls(db_path)
-        except Exception:
+        except:
             dbutils.fs.mkdirs(db_path)
 
 
@@ -177,15 +155,17 @@ class AzureDataHandler:
 class PostgresAzureDataSync:
     def __init__(
         self, postgres_handler: PostgresDataHandler, azure_handler: AzureDataHandler
-    ) -> None:
+    ):
         self.postgres_handler = postgres_handler
         self.azure_handler = azure_handler
 
-    def perform_operation(self, db: str, tables_to_copy: list) -> None:
+    def perform_operation(
+        self, db: str, tables_to_copy: list
+    ) -> None:
         if not self.postgres_handler.is_connection_alive():
             logging.error("PostgreSQL connection is not alive. Aborting operation.")
             return
-
+        
         for table in tables_to_copy:
             try:
                 logging.info(f"Processing table {table}")
@@ -201,17 +181,27 @@ class PostgresAzureDataSync:
 
 # PostgreSQL Configurations
 pg_config = {
-    "host": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-Host-PROD"),
-    "port": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-Port-PROD"),
+    "host": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-Host-PROD"
+    ),
+    "port": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-Port-PROD"
+    ),
     "database": "LeadCustodyRepository",
-    "user": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-User-PROD"),
-    "password": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-Pass-PROD"),
+    "user": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-User-PROD"
+    ),
+    "password": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-Pass-PROD"
+    ),
 }
 
 # Azure Configurations
 storage_config = {
     "account_name": "quilitydatabricks",
-    "account_key": _get_secret(scope="key-vault-secret", key="DataProduct-ADLS-Key"),
+    "account_key": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-ADLS-Key"
+    ),
     "container_name": "dataarchitecture",
 }
 
@@ -222,16 +212,16 @@ tables_to_copy = [
     'public."lead"',
 ]
 
-if run_sync:
-    try:
-        pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
-        postgres_handler = PostgresDataHandler(pg_pool)
-        blob_service_client = AzureDataHandler.connect_to_azure_storage(storage_config)
-        azure_handler = AzureDataHandler(blob_service_client)
-        sync = PostgresAzureDataSync(postgres_handler, azure_handler)
-        sync.perform_operation(
-            pg_config["database"],
-            tables_to_copy,
-        )
-    finally:
-        sync.postgres_handler.pg_pool.closeall()
+# Execution
+try:
+    pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
+    postgres_handler = PostgresDataHandler(pg_pool)
+    blob_service_client = AzureDataHandler.connect_to_azure_storage(storage_config)
+    azure_handler = AzureDataHandler(blob_service_client)
+    sync = PostgresAzureDataSync(postgres_handler, azure_handler)
+    sync.perform_operation(
+        pg_config["database"],
+        tables_to_copy,
+    )
+finally:
+    sync.postgres_handler.pg_pool.closeall()
