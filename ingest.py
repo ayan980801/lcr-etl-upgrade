@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List
 import logging
 import pytz
@@ -17,6 +17,7 @@ from pyspark.sql.functions import (
     coalesce,
     length,
     regexp_replace,
+    max,
 )
 from pyspark.sql.types import (
     BooleanType,
@@ -39,14 +40,38 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create SparkSession
-spark: SparkSession = SparkSession.builder.getOrCreate()
+spark: SparkSession = (
+    SparkSession.builder.master("local[*]")
+    .config("spark.driver.host", "127.0.0.1")
+    .config("spark.driver.bindAddress", "127.0.0.1")
+    .getOrCreate()
+)
 
 try:
     from pyspark.dbutils import DBUtils
 
     dbutils = DBUtils(spark)
+    _dbutils_stub = False
 except Exception:
-    import dbutils  # type: ignore
+
+    class _DummyDBUtils:
+        def __getattr__(self, name):
+            def _(*args, **kwargs):
+                raise RuntimeError("dbutils is not available")
+
+            return _
+
+    dbutils = _DummyDBUtils()  # type: ignore
+    _dbutils_stub = True
+
+
+def _get_secret(scope: str, key: str) -> str:
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)
+    except Exception:
+        logger.warning("Secret %s/%s unavailable, using empty string", scope, key)
+        return ""
+
 
 # Define Snowflake connection configuration for the staging schema
 sf_config_stg: Dict[str, str] = {
@@ -55,12 +80,8 @@ sf_config_stg: Dict[str, str] = {
     "sfWarehouse": "INTEGRATION_COMPUTE_WH",
     "sfRole": "ACCOUNTADMIN",
     "sfSchema": "QUILITY_EDW_STAGE",
-    "sfUser": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-SF-EDW-User"
-    ),
-    "sfPassword": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-SF-EDW-Pass"
-    ),
+    "sfUser": _get_secret(scope="key-vault-secret", key="DataProduct-SF-EDW-User"),
+    "sfPassword": _get_secret(scope="key-vault-secret", key="DataProduct-SF-EDW-Pass"),
     "on_error": "CONTINUE",
 }
 
@@ -454,7 +475,7 @@ def enhanced_parse_timestamp_udf(date_str) -> datetime | None:
 
 @udf(DateType())
 # Safely parse date values with fuzzy fallback while ignoring invalid formats.
-def enhanced_parse_date_udf(date_str) -> datetime.date | None:
+def enhanced_parse_date_udf(date_str) -> date | None:
     if not date_str:
         return None
 
@@ -833,6 +854,7 @@ def process_table(table_name: str) -> None:
                     f"Table STG_LCR_{table_name.upper()} truncated successfully"
                 )
 
+            validate_dataframe(raw_df, target_schema)
             write_options = {
                 **snowflake_config,
                 "dbtable": f"STG_LCR_{table_name.upper()}",
@@ -853,8 +875,8 @@ def process_table(table_name: str) -> None:
             )
             raw_df_filtered = (
                 raw_df
-                if historical_load
-                else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
+                if not historical_load
+                else raw_df.filter(col("MODIFY_DATE") > last_runtime)
             )
 
             if raw_df_filtered.rdd.isEmpty():
@@ -873,9 +895,8 @@ def process_table(table_name: str) -> None:
             raw_df_filtered.write.format("net.snowflake.spark.snowflake").options(
                 **write_options
             ).mode("append").save()
-            update_last_runtime(
-                table_name, datetime.now(pytz.timezone("America/New_York"))
-            )
+            max_ts = raw_df_filtered.agg(max("MODIFY_DATE")).first()[0]
+            update_last_runtime(table_name, max_ts)
             logger.info(
                 f"Appended {record_count} new records to table STG_LCR_{table_name.upper()}"
             )

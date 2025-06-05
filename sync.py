@@ -1,8 +1,8 @@
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
 from psycopg2 import OperationalError
+from psycopg2.pool import ThreadedConnectionPool
 import logging
-import psycopg2
 import traceback
 from pyspark.sql.functions import current_timestamp, lit
 
@@ -14,14 +14,37 @@ logging.basicConfig(
 run_sync: bool = False
 
 # Create SparkSession
-spark = SparkSession.builder.getOrCreate()
+spark = (
+    SparkSession.builder.master("local[*]")
+    .config("spark.driver.host", "127.0.0.1")
+    .config("spark.driver.bindAddress", "127.0.0.1")
+    .getOrCreate()
+)
 
 try:
     from pyspark.dbutils import DBUtils
 
     dbutils = DBUtils(spark)
+    _dbutils_stub = False
 except Exception:
-    import dbutils  # type: ignore
+
+    class _DummyDBUtils:
+        def __getattr__(self, name):
+            def _(*args, **kwargs):
+                raise RuntimeError("dbutils is not available")
+
+            return _
+
+    dbutils = _DummyDBUtils()  # type: ignore
+    _dbutils_stub = True
+
+
+def _get_secret(scope: str, key: str) -> str:
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)
+    except Exception:
+        logging.warning("Secret %s/%s unavailable, using empty string", scope, key)
+        return ""
 
 
 # Postgres Handler
@@ -30,9 +53,9 @@ class PostgresDataHandler:
         self.pg_pool = pg_pool
 
     @staticmethod
-    def connect_to_postgres(pg_config: dict) -> psycopg2.extensions.connection:
+    def connect_to_postgres(pg_config: dict) -> ThreadedConnectionPool:
         try:
-            return psycopg2.pool.ThreadedConnectionPool(1, 500, **pg_config)
+            return ThreadedConnectionPool(1, 500, **pg_config)
         except OperationalError as e:
             logging.error(f"Failed to connect to PostgreSQL: {str(e)}")
             raise
@@ -150,8 +173,13 @@ class AzureDataHandler:
             raise
 
     def ensure_directory_exists(self, stage: str, db: str) -> None:
+        db_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}"
+        if _dbutils_stub:
+            logging.warning(
+                "dbutils unavailable; skipping directory check for %s", db_path
+            )
+            return
         try:
-            db_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}"
             dbutils.fs.ls(db_path)
         except Exception:
             dbutils.fs.mkdirs(db_path)
@@ -185,27 +213,17 @@ class PostgresAzureDataSync:
 
 # PostgreSQL Configurations
 pg_config = {
-    "host": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-LCR-Host-PROD"
-    ),
-    "port": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-LCR-Port-PROD"
-    ),
+    "host": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-Host-PROD"),
+    "port": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-Port-PROD"),
     "database": "LeadCustodyRepository",
-    "user": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-LCR-User-PROD"
-    ),
-    "password": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-LCR-Pass-PROD"
-    ),
+    "user": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-User-PROD"),
+    "password": _get_secret(scope="key-vault-secret", key="DataProduct-LCR-Pass-PROD"),
 }
 
 # Azure Configurations
 storage_config = {
     "account_name": "quilitydatabricks",
-    "account_key": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-ADLS-Key"
-    ),
+    "account_key": _get_secret(scope="key-vault-secret", key="DataProduct-ADLS-Key"),
     "container_name": "dataarchitecture",
 }
 
