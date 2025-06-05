@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List
 import logging
 import pytz
@@ -46,7 +46,24 @@ try:
 
     dbutils = DBUtils(spark)
 except Exception:
-    import dbutils  # type: ignore
+
+    class _DummyDBUtils:
+        def __getattr__(self, name):
+            def _(*args, **kwargs):
+                raise RuntimeError("dbutils is not available")
+
+            return _
+
+    dbutils = _DummyDBUtils()  # type: ignore
+
+
+def _get_secret(scope: str, key: str) -> str:
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)
+    except Exception:
+        logger.warning("Secret %s/%s unavailable, using empty string", scope, key)
+        return ""
+
 
 # Define Snowflake connection configuration for the staging schema
 sf_config_stg: Dict[str, str] = {
@@ -55,12 +72,8 @@ sf_config_stg: Dict[str, str] = {
     "sfWarehouse": "INTEGRATION_COMPUTE_WH",
     "sfRole": "ACCOUNTADMIN",
     "sfSchema": "QUILITY_EDW_STAGE",
-    "sfUser": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-SF-EDW-User"
-    ),
-    "sfPassword": dbutils.secrets.get(
-        scope="key-vault-secret", key="DataProduct-SF-EDW-Pass"
-    ),
+    "sfUser": _get_secret(scope="key-vault-secret", key="DataProduct-SF-EDW-User"),
+    "sfPassword": _get_secret(scope="key-vault-secret", key="DataProduct-SF-EDW-Pass"),
     "on_error": "CONTINUE",
 }
 
@@ -454,7 +467,7 @@ def enhanced_parse_timestamp_udf(date_str) -> datetime | None:
 
 @udf(DateType())
 # Safely parse date values with fuzzy fallback while ignoring invalid formats.
-def enhanced_parse_date_udf(date_str) -> datetime.date | None:
+def enhanced_parse_date_udf(date_str) -> date | None:
     if not date_str:
         return None
 
