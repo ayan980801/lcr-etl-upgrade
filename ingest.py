@@ -29,6 +29,11 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+# Runtime configuration
+historical_load: bool = True
+write_mode: str = "append"
+run_etl: bool = False
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -414,11 +419,8 @@ boolean_string_columns = {
 
 
 @udf(TimestampType())
-def enhanced_parse_timestamp_udf(date_str):
-    """
-    Safely parse timestamp values with fallback for fuzzy parsing,
-    ignoring invalid short or non-numeric strings.
-    """
+# Safely parse timestamp values with fuzzy fallback and future date handling.
+def enhanced_parse_timestamp_udf(date_str) -> datetime | None:
     if not date_str:
         return None
 
@@ -451,11 +453,8 @@ def enhanced_parse_timestamp_udf(date_str):
 
 
 @udf(DateType())
-def enhanced_parse_date_udf(date_str):
-    """
-    Safely parse date values with fallback for fuzzy parsing,
-    ignoring invalid short or non-numeric strings.
-    """
+# Safely parse date values with fuzzy fallback while ignoring invalid formats.
+def enhanced_parse_date_udf(date_str) -> datetime.date | None:
     if not date_str:
         return None
 
@@ -474,10 +473,8 @@ def enhanced_parse_date_udf(date_str):
         return None
 
 
+# Validate DataFrame columns and data types against the target schema.
 def validate_dataframe(df: DataFrame, target_schema: StructType) -> None:
-    """
-    Validates that the DataFrame has all columns with correct data types according to the target schema.
-    """
     logger.info("Validating DataFrame against target schema")
     errors = []
 
@@ -505,11 +502,8 @@ def validate_dataframe(df: DataFrame, target_schema: StructType) -> None:
     logger.info("DataFrame validation completed successfully")
 
 
+# Retrieve the last runtime for the given table from DBFS.
 def get_last_runtime(table_name: str) -> datetime:
-    """
-    Retrieves the last runtime for the given table from DBFS.
-    If not found, returns a past date to include all records.
-    """
     try:
         last_runtime_path = f"dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata/last_runtime_{table_name}.txt"
         last_runtime_str = spark.read.text(last_runtime_path).first()[0]
@@ -527,10 +521,8 @@ def get_last_runtime(table_name: str) -> datetime:
         return past_date
 
 
+# Update the last runtime for the given table in DBFS.
 def update_last_runtime(table_name: str, new_runtime: datetime) -> None:
-    """
-    Updates the last runtime for the given table in DBFS.
-    """
     try:
         last_runtime_path = f"dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata/last_runtime_{table_name}.txt"
         new_runtime_str = new_runtime.strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -544,11 +536,8 @@ def update_last_runtime(table_name: str, new_runtime: datetime) -> None:
         )
 
 
+# Remove obviously invalid timestamp values and replace ETL nulls with now.
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
-    """
-    Removes obviously invalid timestamp values from timestamp columns,
-    setting them to null or a default as needed.
-    """
     timestamp_cols = [
         field.name
         for field in df.schema.fields
@@ -576,9 +565,7 @@ def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
 def transform_column(
     df: DataFrame, col_name: str, col_type, table_name: str
 ) -> DataFrame:
-    """
-    Transforms/cleans a single column to match the target data type, with special handling for JSON columns, etc.
-    """
+    # Transform a single column to match the target type with JSON handling.
     # Handle JSON columns
     if table_name in json_columns and col_name in json_columns[table_name]:
         logger.info(
@@ -668,10 +655,8 @@ def transform_column(
 
 
 def load_raw_data(table_name: str) -> DataFrame:
-    """
-    Loads raw data for the given table from Delta storage.
-    IMPORTANT: Ensure path matches the sync script's location so data is not duplicated.
-    """
+    # Load raw data for the given table from Delta storage.
+    # IMPORTANT: path must match the sync script output to avoid duplication.
     raw_table_name: str = table_name.replace("_", "")
     # This path is now corrected (removed the "public." prefix) to match the sync script
     raw_dataset_path: str = (
@@ -699,9 +684,7 @@ def load_raw_data(table_name: str) -> DataFrame:
 
 
 def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
-    """
-    Renames columns based on column_mappings and adds missing columns as null, matching the target schema.
-    """
+    # Rename columns based on mappings and add missing columns as null.
     df_columns_lower = {column.lower(): column for column in df.columns}
 
     # Rename columns
@@ -724,9 +707,7 @@ def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
 def transform_columns(
     df: DataFrame, target_schema: StructType, table_name: str
 ) -> DataFrame:
-    """
-    Cleans invalid timestamps first, then applies transform_column for each target column.
-    """
+    # Clean timestamps then transform each column.
     df = clean_invalid_timestamps(df)
     for field in target_schema.fields:
         df = transform_column(df, field.name, field.dataType, table_name)
@@ -734,9 +715,7 @@ def transform_columns(
 
 
 def add_metadata_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
-    """
-    Adds ETL metadata columns with consistent timestamps and default values.
-    """
+    # Add ETL metadata columns with consistent timestamps and defaults.
     etl_timestamp = current_timestamp()
     metadata_defaults = {
         "ETL_CREATED_DATE": etl_timestamp,
@@ -754,13 +733,8 @@ def add_metadata_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
     return df
 
 
-def process_table(
-    table_name: str, write_mode: str, historical_load: bool = False
-) -> None:
-    """
-    Main workflow for a single table: load raw data, rename columns,
-    transform data, handle special logic, validate, and write to Snowflake.
-    """
+def process_table(table_name: str) -> None:
+    # Main workflow for a single table including validation and Snowflake load.
     logger.info(f"Starting processing for table: {table_name}")
     try:
         # 1) Load raw data
@@ -917,22 +891,10 @@ def process_table(
         raise
 
 
-def main():
-    """
-    Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
-    """
-    write_mode = "append"
-    historical_load = True
-
+if run_etl:
     for table in tables:
-        should_process = table_processing_config.get(table, False)
-        if should_process:
-            process_table(table, write_mode, historical_load)
+        if table_processing_config.get(table, False):
+            process_table(table)
         else:
             logger.info(f"Skipping processing for table: {table} as per configuration.")
-
     logger.info("ETL process completed successfully.")
-
-
-if __name__ == "__main__":
-    main()

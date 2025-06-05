@@ -10,6 +10,9 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Runtime configuration
+run_sync: bool = False
+
 # Create SparkSession
 spark = SparkSession.builder.getOrCreate()
 
@@ -23,7 +26,7 @@ except Exception:
 
 # Postgres Handler
 class PostgresDataHandler:
-    def __init__(self, pg_pool):
+    def __init__(self, pg_pool) -> None:
         self.pg_pool = pg_pool
 
     @staticmethod
@@ -34,7 +37,7 @@ class PostgresDataHandler:
             logging.error(f"Failed to connect to PostgreSQL: {str(e)}")
             raise
 
-    def is_connection_alive(self):
+    def is_connection_alive(self) -> bool:
         conn = self.pg_pool.getconn()
         try:
             with conn.cursor() as cursor:
@@ -46,7 +49,7 @@ class PostgresDataHandler:
             self.pg_pool.putconn(conn)
 
     def get_table_count(self, table: str) -> int:
-        """Get actual row count from PostgreSQL table"""
+        # Get actual row count from PostgreSQL table
         conn = self.pg_pool.getconn()
         try:
             with conn.cursor() as cursor:
@@ -58,10 +61,7 @@ class PostgresDataHandler:
             self.pg_pool.putconn(conn)
 
     def export_table_to_delta(self, table: str, stage: str, db: str) -> None:
-        """
-        Export a table directly from PostgreSQL to Delta Lake using JDBC
-        This bypasses CSV completely and avoids all the row count issues
-        """
+        # Export a table directly from PostgreSQL to Delta Lake using JDBC
         try:
             # Get actual row count from PostgreSQL for verification
             pg_count = self.get_table_count(table)
@@ -137,7 +137,7 @@ class PostgresDataHandler:
 
 # Azure Data Handler
 class AzureDataHandler:
-    def __init__(self, blob_service_client):
+    def __init__(self, blob_service_client) -> None:
         self.blob_service_client = blob_service_client
 
     @staticmethod
@@ -161,7 +161,7 @@ class AzureDataHandler:
 class PostgresAzureDataSync:
     def __init__(
         self, postgres_handler: PostgresDataHandler, azure_handler: AzureDataHandler
-    ):
+    ) -> None:
         self.postgres_handler = postgres_handler
         self.azure_handler = azure_handler
 
@@ -216,16 +216,16 @@ tables_to_copy = [
     'public."lead"',
 ]
 
-# Execution
-try:
-    pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
-    postgres_handler = PostgresDataHandler(pg_pool)
-    blob_service_client = AzureDataHandler.connect_to_azure_storage(storage_config)
-    azure_handler = AzureDataHandler(blob_service_client)
-    sync = PostgresAzureDataSync(postgres_handler, azure_handler)
-    sync.perform_operation(
-        pg_config["database"],
-        tables_to_copy,
-    )
-finally:
-    sync.postgres_handler.pg_pool.closeall()
+if run_sync:
+    try:
+        pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
+        postgres_handler = PostgresDataHandler(pg_pool)
+        blob_service_client = AzureDataHandler.connect_to_azure_storage(storage_config)
+        azure_handler = AzureDataHandler(blob_service_client)
+        sync = PostgresAzureDataSync(postgres_handler, azure_handler)
+        sync.perform_operation(
+            pg_config["database"],
+            tables_to_copy,
+        )
+    finally:
+        sync.postgres_handler.pg_pool.closeall()
