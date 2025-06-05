@@ -1,12 +1,8 @@
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
-from psycopg2 import extras, pool, OperationalError
-from typing import Dict, Optional
-import concurrent.futures
+from psycopg2 import OperationalError
 import logging
-import os
 import psycopg2
-import re
 import traceback
 from pyspark.sql.functions import current_timestamp, lit
 
@@ -16,6 +12,13 @@ logging.basicConfig(
 
 # Create SparkSession
 spark = SparkSession.builder.getOrCreate()
+
+try:
+    from pyspark.dbutils import DBUtils
+
+    dbutils = DBUtils(spark)
+except Exception:
+    import dbutils  # type: ignore
 
 
 # Postgres Handler
@@ -63,36 +66,35 @@ class PostgresDataHandler:
             # Get actual row count from PostgreSQL for verification
             pg_count = self.get_table_count(table)
             logging.info(f"Starting direct JDBC export of {pg_count} rows from {table}")
-            
+
             # Create JDBC URL and properties
             jdbc_url = f"jdbc:postgresql://{pg_config['host']}:{pg_config['port']}/{pg_config['database']}"
             properties = {
-                "user": pg_config['user'],
-                "password": pg_config['password'],
+                "user": pg_config["user"],
+                "password": pg_config["password"],
                 "driver": "org.postgresql.Driver",
                 # Increase fetch size for better performance
-                "fetchsize": "10000"
+                "fetchsize": "10000",
             }
-            
-            # Table name without quotes for JDBC
-            table_name = table.replace('"', '')
-            
+
             # Use Spark's JDBC reader to load directly from PostgreSQL
             # This completely avoids any CSV intermediate step
             df = spark.read.jdbc(url=jdbc_url, table=table, properties=properties)
-            
+
             # Log the schema to verify correct data types
             logging.info(f"JDBC schema for {table}:")
             for field in df.schema.fields:
                 logging.info(f"  {field.name}: {field.dataType}")
-            
+
             # Count rows to verify
             jdbc_count = df.count()
             logging.info(f"JDBC read {jdbc_count} rows from {table}")
-            
+
             if jdbc_count != pg_count:
-                logging.warning(f"Row count mismatch: PostgreSQL={pg_count}, JDBC={jdbc_count}")
-            
+                logging.warning(
+                    f"Row count mismatch: PostgreSQL={pg_count}, JDBC={jdbc_count}"
+                )
+
             # Add metadata columns
             df = df.withColumns(
                 {
@@ -103,26 +105,30 @@ class PostgresDataHandler:
                     "EDW_EXTERNAL_SOURCE_SYSTEM": lit("LeadCustodyRepository"),
                 }
             )
-            
+
             # Calculate Delta Lake path
-            clean_table = table.replace('public."', '').replace('"', '')
+            clean_table = table.replace('public."', "").replace('"', "")
             flp = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}/{clean_table}"
-            
+
             # Write to Delta Lake
             df.write.format("delta").mode("overwrite").option(
                 "overwriteSchema", "true"
             ).save(flp)
-            
+
             # Verify Delta file row count
             delta_df = spark.read.format("delta").load(flp)
             delta_count = delta_df.count()
             logging.info(f"Delta file count for {table}: {delta_count}")
-            
+
             if delta_count != jdbc_count:
-                logging.warning(f"Delta count ({delta_count}) doesn't match JDBC count ({jdbc_count})")
+                logging.warning(
+                    f"Delta count ({delta_count}) doesn't match JDBC count ({jdbc_count})"
+                )
             else:
-                logging.info(f"Successfully exported {delta_count} rows from {table} to Delta")
-                
+                logging.info(
+                    f"Successfully exported {delta_count} rows from {table} to Delta"
+                )
+
         except Exception as e:
             logging.error(f"Failed to export table '{table}': {str(e)}")
             logging.error(traceback.format_exc())
@@ -147,7 +153,7 @@ class AzureDataHandler:
         try:
             db_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}"
             dbutils.fs.ls(db_path)
-        except:
+        except Exception:
             dbutils.fs.mkdirs(db_path)
 
 
@@ -159,13 +165,11 @@ class PostgresAzureDataSync:
         self.postgres_handler = postgres_handler
         self.azure_handler = azure_handler
 
-    def perform_operation(
-        self, db: str, tables_to_copy: list
-    ) -> None:
+    def perform_operation(self, db: str, tables_to_copy: list) -> None:
         if not self.postgres_handler.is_connection_alive():
             logging.error("PostgreSQL connection is not alive. Aborting operation.")
             return
-        
+
         for table in tables_to_copy:
             try:
                 logging.info(f"Processing table {table}")
