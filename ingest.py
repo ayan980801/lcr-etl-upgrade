@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime
 from typing import Dict, List
 import logging
 import pytz
@@ -6,33 +6,13 @@ import dateutil.parser
 import traceback
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
-    col,
-    current_timestamp,
-    lit,
-    udf,
-    to_date,
-    to_timestamp,
-    when,
-    lower,
-    coalesce,
-    length,
-    regexp_replace,
+    col, current_timestamp, lit, udf, to_date, to_timestamp, when, lower,
+    coalesce, length, regexp_replace
 )
 from pyspark.sql.types import (
-    BooleanType,
-    DateType,
-    DecimalType,
-    DoubleType,
-    StringType,
-    StructField,
-    StructType,
-    TimestampType,
+    BooleanType, DateType, DecimalType, DoubleType, StringType,
+    StructField, StructType, TimestampType
 )
-
-# Runtime configuration
-historical_load: bool = True
-write_mode: str = "append"
-run_etl: bool = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,30 +21,6 @@ logger = logging.getLogger(__name__)
 # Create SparkSession
 spark: SparkSession = SparkSession.builder.getOrCreate()
 
-try:
-    from pyspark.dbutils import DBUtils
-
-    dbutils = DBUtils(spark)
-except Exception:
-
-    class _DummyDBUtils:
-        def __getattr__(self, name):
-            def _(*args, **kwargs):
-                raise RuntimeError("dbutils is not available")
-
-            return _
-
-    dbutils = _DummyDBUtils()  # type: ignore
-
-
-def _get_secret(scope: str, key: str) -> str:
-    try:
-        return dbutils.secrets.get(scope=scope, key=key)
-    except Exception:
-        logger.warning("Secret %s/%s unavailable, using empty string", scope, key)
-        return ""
-
-
 # Define Snowflake connection configuration for the staging schema
 sf_config_stg: Dict[str, str] = {
     "sfURL": "",
@@ -72,13 +28,14 @@ sf_config_stg: Dict[str, str] = {
     "sfWarehouse": "INTEGRATION_COMPUTE_WH",
     "sfRole": "ACCOUNTADMIN",
     "sfSchema": "QUILITY_EDW_STAGE",
-    "sfUser": _get_secret(scope="key-vault-secret", key="DataProduct-SF-EDW-User"),
-    "sfPassword": _get_secret(scope="key-vault-secret", key="DataProduct-SF-EDW-Pass"),
+    "sfUser": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-SF-EDW-User"
+    ),
+    "sfPassword": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-SF-EDW-Pass"
+    ),
     "on_error": "CONTINUE",
 }
-
-# Default Snowflake configuration used throughout the script
-snowflake_config = sf_config_stg
 
 # Table Configurations
 tables: List[str] = ["lead_assignment", "lead_xref", "lead"]
@@ -94,7 +51,7 @@ table_processing_config: Dict[str, bool] = {
 json_columns = {
     "lead_assignment": ["METADATA"],
     "lead": ["LEAD_ATTRIBUTES"],
-    "lead_xref": [],
+    "lead_xref": []
 }
 
 # Schema definitions
@@ -430,16 +387,16 @@ boolean_string_columns = {
     "IS_DELETED_SOURCE",
 }
 
-
 @udf(TimestampType())
-# Safely parse timestamp values with fuzzy fallback and future date handling.
-def enhanced_parse_timestamp_udf(date_str) -> datetime | None:
+def enhanced_parse_timestamp_udf(date_str):
+    """
+    Safely parse timestamp values with fallback for fuzzy parsing,
+    ignoring invalid short or non-numeric strings.
+    """
     if not date_str:
         return None
 
-    if isinstance(date_str, str) and (
-        len(date_str) <= 3 or not any(c.isdigit() for c in date_str)
-    ):
+    if isinstance(date_str, str) and (len(date_str) <= 3 or not any(c.isdigit() for c in date_str)):
         return None
 
     try:
@@ -456,24 +413,24 @@ def enhanced_parse_timestamp_udf(date_str) -> datetime | None:
             return current_datetime
 
         return parsed_date
-    except Exception:
+    except:
         try:
             # fallback to fuzzy parsing
             parsed_date = dateutil.parser.parse(str(date_str), fuzzy=True)
             return parsed_date
-        except Exception:
+        except:
             return None
 
-
 @udf(DateType())
-# Safely parse date values with fuzzy fallback while ignoring invalid formats.
-def enhanced_parse_date_udf(date_str) -> date | None:
+def enhanced_parse_date_udf(date_str):
+    """
+    Safely parse date values with fallback for fuzzy parsing,
+    ignoring invalid short or non-numeric strings.
+    """
     if not date_str:
         return None
 
-    if isinstance(date_str, str) and (
-        len(date_str) <= 3 or not any(c.isdigit() for c in date_str)
-    ):
+    if isinstance(date_str, str) and (len(date_str) <= 3 or not any(c.isdigit() for c in date_str)):
         return None
 
     try:
@@ -482,19 +439,20 @@ def enhanced_parse_date_udf(date_str) -> date | None:
         if parsed_date > current_date:
             return None
         return parsed_date
-    except Exception:
+    except:
         return None
 
-
-# Validate DataFrame columns and data types against the target schema.
 def validate_dataframe(df: DataFrame, target_schema: StructType) -> None:
+    """
+    Validates that the DataFrame has all columns with correct data types according to the target schema.
+    """
     logger.info("Validating DataFrame against target schema")
     errors = []
-
+    
     for field in target_schema.fields:
         col_name = field.name
         col_type = field.dataType
-
+        
         if col_name not in df.columns:
             error_msg = f"Column {col_name} is missing from the DataFrame"
             errors.append(error_msg)
@@ -506,17 +464,19 @@ def validate_dataframe(df: DataFrame, target_schema: StructType) -> None:
             )
             errors.append(error_msg)
             logger.error(error_msg)
-
+            
     if errors:
         raise ValueError(
             "DataFrame validation failed with errors:\n" + "\n".join(errors)
         )
-
+        
     logger.info("DataFrame validation completed successfully")
 
-
-# Retrieve the last runtime for the given table from DBFS.
 def get_last_runtime(table_name: str) -> datetime:
+    """
+    Retrieves the last runtime for the given table from DBFS.
+    If not found, returns a past date to include all records.
+    """
     try:
         last_runtime_path = f"dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata/last_runtime_{table_name}.txt"
         last_runtime_str = spark.read.text(last_runtime_path).first()[0]
@@ -526,81 +486,78 @@ def get_last_runtime(table_name: str) -> datetime:
         logger.info(f"Last runtime for table {table_name}: {last_runtime}")
         return last_runtime
     except Exception as e:
-        logger.warning(
-            f"Could not read last runtime for table {table_name}. Error: {str(e)}"
-        )
+        logger.warning(f"Could not read last runtime for table {table_name}. Error: {str(e)}")
         past_date = datetime(1900, 1, 1, tzinfo=pytz.timezone("America/New_York"))
         logger.info(f"Setting last_runtime to {past_date} for table {table_name}")
         return past_date
 
-
-# Update the last runtime for the given table in DBFS.
 def update_last_runtime(table_name: str, new_runtime: datetime) -> None:
+    """
+    Updates the last runtime for the given table in DBFS.
+    """
     try:
         last_runtime_path = f"dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata/last_runtime_{table_name}.txt"
         new_runtime_str = new_runtime.strftime("%Y-%m-%d %H:%M:%S.%f")
-        spark.createDataFrame([(new_runtime_str,)], ["last_runtime"]).coalesce(
-            1
-        ).write.mode("overwrite").text(last_runtime_path)
+        spark.createDataFrame([(new_runtime_str,)], ["last_runtime"]).coalesce(1)\
+            .write.mode("overwrite").text(last_runtime_path)
         logger.info(f"Updated last runtime for table {table_name} to {new_runtime}")
     except Exception as e:
-        logger.error(
-            f"Could not update last runtime for table {table_name}. Error: {str(e)}"
-        )
+        logger.error(f"Could not update last runtime for table {table_name}. Error: {str(e)}")
 
-
-# Remove obviously invalid timestamp values and replace ETL nulls with now.
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
+    """
+    Removes obviously invalid timestamp values from timestamp columns,
+    setting them to null or a default as needed.
+    """
     timestamp_cols = [
         field.name
         for field in df.schema.fields
         if isinstance(field.dataType, TimestampType)
     ]
-
+    
     for ts_col in timestamp_cols:
         df = df.withColumn(
             ts_col,
             when(
-                (col(ts_col).isNull())
-                | (col(ts_col).cast("string").rlike("^[A-Za-z]{1,3}$"))
-                | (length(col(ts_col).cast("string")) <= 3)
-                | (~col(ts_col).cast("string").rlike(".*\\d+.*")),
-                lit(None),
-            ).otherwise(col(ts_col)),
+                (col(ts_col).isNull()) |
+                (col(ts_col).cast("string").rlike("^[A-Za-z]{1,3}$")) |
+                (length(col(ts_col).cast("string")) <= 3) |
+                (~col(ts_col).cast("string").rlike(".*\\d+.*")),
+                lit(None)
+            ).otherwise(col(ts_col))
         )
-
+        
         if ts_col.startswith("ETL_"):
-            df = df.withColumn(ts_col, coalesce(col(ts_col), current_timestamp()))
-
+            df = df.withColumn(
+                ts_col,
+                coalesce(col(ts_col), current_timestamp())
+            )
+    
     return df
 
-
-def transform_column(
-    df: DataFrame, col_name: str, col_type, table_name: str
-) -> DataFrame:
-    # Transform a single column to match the target type with JSON handling.
+def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) -> DataFrame:
+    """
+    Transforms/cleans a single column to match the target data type, with special handling for JSON columns, etc.
+    """
     # Handle JSON columns
     if table_name in json_columns and col_name in json_columns[table_name]:
-        logger.info(
-            f"Applying JSON string handling for column {col_name} in table {table_name}"
-        )
+        logger.info(f"Applying JSON string handling for column {col_name} in table {table_name}")
         return df.withColumn(
             col_name,
-            when(col(col_name).isNull(), lit(None)).otherwise(
-                col(col_name).cast(StringType())
-            ),
+            when(col(col_name).isNull(), lit(None))
+            .otherwise(col(col_name).cast(StringType()))
         )
-
+    
     # Timestamp
     if isinstance(col_type, TimestampType):
         df = df.withColumn(
             col_name,
             when(
-                (col(col_name).cast("string").rlike("^[A-Za-z]{1,3}$"))
-                | (length(col(col_name).cast("string")) <= 3)
-                | (~col(col_name).cast("string").rlike(".*\\d+.*")),
-                lit(None),
-            ).otherwise(col(col_name)),
+                (col(col_name).cast("string").rlike("^[A-Za-z]{1,3}$")) |
+                (length(col(col_name).cast("string")) <= 3) |
+                (~col(col_name).cast("string").rlike(".*\\d+.*")),
+                lit(None)
+            ).otherwise(col(col_name))
         )
         return df.withColumn(
             col_name,
@@ -611,7 +568,7 @@ def transform_column(
                 )
             ),
         )
-
+    
     # Date
     elif isinstance(col_type, DateType):
         return df.withColumn(
@@ -623,18 +580,16 @@ def transform_column(
                 )
             ),
         )
-
+    
     # Decimal
     elif isinstance(col_type, DecimalType):
         precision, scale = col_type.precision, col_type.scale
-        return df.withColumn(
-            col_name, col(col_name).cast(DecimalType(precision, scale))
-        )
-
+        return df.withColumn(col_name, col(col_name).cast(DecimalType(precision, scale)))
+    
     # Double
     elif isinstance(col_type, DoubleType):
         return df.withColumn(col_name, col(col_name).cast(DoubleType()))
-
+    
     # Boolean
     elif isinstance(col_type, BooleanType):
         return df.withColumn(
@@ -647,11 +602,11 @@ def transform_column(
                     length(col(col_name)) == 1,
                     when(lower(col(col_name)) == "t", lit(True))
                     .when(lower(col(col_name)) == "f", lit(False))
-                    .otherwise(lit(None)),
+                    .otherwise(lit(None))
                 ).otherwise(lit(None))
             ),
         )
-
+    
     # Boolean strings
     elif isinstance(col_type, StringType) and col_name in boolean_string_columns:
         return df.withColumn(
@@ -661,20 +616,19 @@ def transform_column(
             .when(col(col_name).isNull(), lit(None))
             .otherwise(col(col_name)),
         )
-
+    
     # Fallback to String
     else:
         return df.withColumn(col_name, col(col_name).cast(StringType()))
 
-
 def load_raw_data(table_name: str) -> DataFrame:
-    # Load raw data for the given table from Delta storage.
-    # IMPORTANT: path must match the sync script output to avoid duplication.
+    """
+    Loads raw data for the given table from Delta storage.
+    IMPORTANT: Ensure path matches the sync script's location so data is not duplicated.
+    """
     raw_table_name: str = table_name.replace("_", "")
     # This path is now corrected (removed the "public." prefix) to match the sync script
-    raw_dataset_path: str = (
-        f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/RAW/LeadCustodyRepository/{raw_table_name}"
-    )
+    raw_dataset_path: str = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/RAW/LeadCustodyRepository/{raw_table_name}"
 
     if table_name == "lead_assignment":
         logger.info(f"Loading {table_name} with special JSON handling")
@@ -695,40 +649,39 @@ def load_raw_data(table_name: str) -> DataFrame:
             .load(raw_dataset_path)
         )
 
-
 def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
-    # Rename columns based on mappings and add missing columns as null.
+    """
+    Renames columns based on column_mappings and adds missing columns as null, matching the target schema.
+    """
     df_columns_lower = {column.lower(): column for column in df.columns}
-
+    
     # Rename columns
     for old_col, new_col in column_mappings[table_name].items():
         if old_col.lower() in df_columns_lower:
             original_col = df_columns_lower[old_col.lower()]
             df = df.withColumnRenamed(original_col, new_col)
-
+            
     # Add missing columns
     target_schema: StructType = table_schemas[table_name]
-    missing_columns = set(field.name for field in target_schema.fields) - set(
-        df.columns
-    )
+    missing_columns = set(field.name for field in target_schema.fields) - set(df.columns)
     for col_name in missing_columns:
         df = df.withColumn(col_name, lit(None).cast(target_schema[col_name].dataType))
-
+        
     return df
 
-
-def transform_columns(
-    df: DataFrame, target_schema: StructType, table_name: str
-) -> DataFrame:
-    # Clean timestamps then transform each column.
+def transform_columns(df: DataFrame, target_schema: StructType, table_name: str) -> DataFrame:
+    """
+    Cleans invalid timestamps first, then applies transform_column for each target column.
+    """
     df = clean_invalid_timestamps(df)
     for field in target_schema.fields:
         df = transform_column(df, field.name, field.dataType, table_name)
     return df
 
-
 def add_metadata_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
-    # Add ETL metadata columns with consistent timestamps and defaults.
+    """
+    Adds ETL metadata columns with consistent timestamps and default values.
+    """
     etl_timestamp = current_timestamp()
     metadata_defaults = {
         "ETL_CREATED_DATE": etl_timestamp,
@@ -737,44 +690,45 @@ def add_metadata_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
         "TO_PROCESS": lit(True),
         "EDW_EXTERNAL_SOURCE_SYSTEM": lit("LeadCustodyRepository"),
     }
-
+    
     for col_name, default_value in metadata_defaults.items():
         df = df.withColumn(
-            col_name, default_value.cast(target_schema[col_name].dataType)
+            col_name,
+            default_value.cast(target_schema[col_name].dataType)
         )
-
+        
     return df
 
-
-def process_table(table_name: str) -> None:
-    # Main workflow for a single table including validation and Snowflake load.
+def process_table(
+    table_name: str,
+    write_mode: str,
+    historical_load: bool = False
+) -> None:
+    """
+    Main workflow for a single table: load raw data, rename columns,
+    transform data, handle special logic, validate, and write to Snowflake.
+    """
     logger.info(f"Starting processing for table: {table_name}")
     try:
         # 1) Load raw data
         raw_df = load_raw_data(table_name)
         source_count = raw_df.count()
-        logger.info(
-            f"Loaded {source_count} raw records from source for table {table_name}"
-        )
-
+        logger.info(f"Loaded {source_count} raw records from source for table {table_name}")
+        
         # 2) Rename columns and add missing ones
         raw_df = rename_and_add_columns(raw_df, table_name)
         after_rename_count = raw_df.count()
         if after_rename_count != source_count:
-            logger.warning(
-                f"Row count changed after column renaming: {source_count} -> {after_rename_count}"
-            )
-
+            logger.warning(f"Row count changed after column renaming: {source_count} -> {after_rename_count}")
+        
         # 3) Transform columns
         target_schema = table_schemas[table_name]
         raw_df = transform_columns(raw_df, target_schema, table_name)
         after_transform_count = raw_df.count()
         logger.info(f"Data transformation completed for table {table_name}")
-
+        
         if after_transform_count != after_rename_count:
-            logger.warning(
-                f"Row count changed after transformation: {after_rename_count} -> {after_transform_count}"
-            )
+            logger.warning(f"Row count changed after transformation: {after_rename_count} -> {after_transform_count}")
 
         # 4) Special handling for lead_assignment
         if table_name == "lead_assignment":
@@ -790,25 +744,21 @@ def process_table(table_name: str) -> None:
             for date_col in date_columns:
                 raw_df = raw_df.withColumn(
                     date_col,
-                    when(col(date_col) > current_date, current_date).otherwise(
-                        col(date_col)
-                    ),
+                    when(col(date_col) > current_date, current_date).otherwise(col(date_col))
                 )
             raw_df = raw_df.withColumn(
                 "METADATA",
-                when(col("METADATA").isNull(), lit(None)).otherwise(
-                    col("METADATA").cast(StringType())
-                ),
+                when(col("METADATA").isNull(), lit(None)).otherwise(col("METADATA").cast(StringType()))
             )
             logger.info("Applied lead assignment specific handling")
-
+        
         # 5) Add metadata columns
         raw_df = add_metadata_columns(raw_df, target_schema)
-
+        
         # 6) Reorder columns to match target schema
         target_columns = [field.name for field in target_schema.fields]
         raw_df = raw_df.select(*target_columns)
-
+        
         # 7) Final timestamp cleanup
         raw_df = clean_invalid_timestamps(raw_df)
 
@@ -821,12 +771,10 @@ def process_table(table_name: str) -> None:
             raw_df = raw_df.withColumn(
                 ts_col,
                 when(
-                    col(ts_col).isNull()
-                    | regexp_replace(
-                        col(ts_col).cast("string"), "[0-9\\-:. ]", ""
-                    ).rlike(".+"),
-                    current_timestamp() if ts_col.startswith("ETL_") else lit(None),
-                ).otherwise(col(ts_col)),
+                    col(ts_col).isNull() |
+                    regexp_replace(col(ts_col).cast("string"), "[0-9\\-:. ]", "").rlike(".+"),
+                    current_timestamp() if ts_col.startswith("ETL_") else lit(None)
+                ).otherwise(col(ts_col))
             )
 
         # 9) Write to Snowflake
@@ -835,40 +783,26 @@ def process_table(table_name: str) -> None:
                 truncate_options = {
                     **snowflake_config,
                     "dbtable": f"STG_LCR_{table_name.upper()}",
-                    "truncate_table": "on",
+                    "truncate_table": "on"
                 }
                 dummy_df = spark.createDataFrame([], target_schema)
                 # Using the Snowflake connector format "net.snowflake.spark.snowflake"
-                dummy_df.write.format("net.snowflake.spark.snowflake").options(
-                    **truncate_options
-                ).mode("overwrite").save()
-                logger.info(
-                    f"Table STG_LCR_{table_name.upper()} truncated successfully"
-                )
+                dummy_df.write.format("net.snowflake.spark.snowflake").options(**truncate_options).mode("overwrite").save()
+                logger.info(f"Table STG_LCR_{table_name.upper()} truncated successfully")
 
             write_options = {
                 **snowflake_config,
                 "dbtable": f"STG_LCR_{table_name.upper()}",
                 "on_error": "CONTINUE",
-                "column_mapping": "name",
+                "column_mapping": "name"
             }
-            raw_df.write.format("net.snowflake.spark.snowflake").options(
-                **write_options
-            ).mode("append").save()
-            logger.info(
-                f"Successfully wrote {after_transform_count} rows to Snowflake for table {table_name}"
-            )
+            raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
+            logger.info(f"Successfully wrote {final_count} rows to Snowflake for table {table_name}")
 
         elif write_mode == "delta_insert":
             last_runtime = get_last_runtime(table_name)
-            raw_df = raw_df.withColumn(
-                "MODIFY_DATE", coalesce(col("MODIFY_DATE"), col("CREATE_DATE"))
-            )
-            raw_df_filtered = (
-                raw_df
-                if historical_load
-                else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
-            )
+            raw_df = raw_df.withColumn("MODIFY_DATE", coalesce(col("MODIFY_DATE"), col("CREATE_DATE")))
+            raw_df_filtered = raw_df if historical_load else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
 
             if raw_df_filtered.rdd.isEmpty():
                 logger.info(f"No new records to process for table {table_name}")
@@ -881,17 +815,11 @@ def process_table(table_name: str) -> None:
                 "dbtable": f"STG_LCR_{table_name.upper()}",
                 "column_mapping": "name",
                 "on_error": "CONTINUE",
-                "truncate": "true",
+                "truncate": "true"
             }
-            raw_df_filtered.write.format("net.snowflake.spark.snowflake").options(
-                **write_options
-            ).mode("append").save()
-            update_last_runtime(
-                table_name, datetime.now(pytz.timezone("America/New_York"))
-            )
-            logger.info(
-                f"Appended {record_count} new records to table STG_LCR_{table_name.upper()}"
-            )
+            raw_df_filtered.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
+            update_last_runtime(table_name, datetime.now(pytz.timezone("America/New_York")))
+            logger.info(f"Appended {record_count} new records to table STG_LCR_{table_name.upper()}")
 
         else:
             raise ValueError(f"Invalid write mode: {write_mode}")
@@ -903,11 +831,21 @@ def process_table(table_name: str) -> None:
         logger.error(traceback.format_exc())
         raise
 
+def main():
+    """
+    Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
+    """
+    write_mode = "append"
+    historical_load = True
 
-if run_etl:
     for table in tables:
-        if table_processing_config.get(table, False):
-            process_table(table)
+        should_process = table_processing_config.get(table, False)
+        if should_process:
+            process_table(table, write_mode, historical_load)
         else:
             logger.info(f"Skipping processing for table: {table} as per configuration.")
+
     logger.info("ETL process completed successfully.")
+
+if __name__ == "__main__":
+    main()
